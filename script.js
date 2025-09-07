@@ -16,6 +16,7 @@ const connectedChatsList = document.getElementById("connectedChatsList");
 const connectedChatsListMobile = document.getElementById(
   "connectedChatsListMobile"
 );
+const backendUrl = "https://backend-1-75se.onrender.com";
 const shareFileBtn = document.getElementById("shareFileBtn");
 const fileInput = document.getElementById("fileInput");
 const recordAudioBtn = document.getElementById("recordAudioBtn");
@@ -242,12 +243,11 @@ let callPartnerId = null; // For private calls
 let incomingCallData = null;
 let isMakingOffer = {}; // Track offer status per peer
 
-// --- P2P FILE TRANSFER STATE ---
-const fileTransferConnections = {}; // Separate connections for file transfers
-const fileChunks = {};
-const FILE_CHUNK_SIZE = 16384; // 16 KB
 let incomingFileRequest = null;
 let currentFileTransfer = null;
+const FILE_CHUNK_SIZE = 16 * 1024; // 16KB chunk size for file transfers
+let fileTransferConnections = {}; // Stores P2P connections for file transfers
+let fileChunks = {}; // Stores incoming file chunks
 
 // --- WEBRTC CONFIGURATION ---
 const peerConnectionConfig = {
@@ -330,18 +330,15 @@ registerForm.addEventListener("submit", async (e) => {
   const password = document.getElementById("registerPassword").value;
 
   try {
-    const response = await fetch(
-      "https://backend-1-75se.onrender.com/register",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          username,
-          password,
-          profilePicture: newProfilePictureDataUrl,
-        }),
-      }
-    );
+    const response = await fetch(backendUrl + "/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username,
+        password,
+        profilePicture: newProfilePictureDataUrl,
+      }),
+    });
     const data = await response.json();
     if (response.ok) {
       showAlert(
@@ -372,7 +369,7 @@ loginForm.addEventListener("submit", async (e) => {
   const password = document.getElementById("loginPassword").value;
 
   try {
-    const response = await fetch("https://backend-1-75se.onrender.com/login", {
+    const response = await fetch(backendUrl + "/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
@@ -424,7 +421,7 @@ function connectSocket(token) {
   if (socket && socket.active) {
     socket.disconnect();
   }
-  socket = io("https://backend-1-75se.onrender.com/", {
+  socket = io(backendUrl, {
     auth: {
       token,
     },
@@ -878,6 +875,20 @@ function setupSocketListeners() {
     incomingCallAvatar.innerHTML = renderAvatar(from);
     incomingCallModal.style.display = "flex";
   });
+  socket.on("call:incoming", async ({ from, offer }) => {
+    if (
+      isCallActive ||
+      incomingCallData ||
+      privateRequestModal.style.display === "flex"
+    ) {
+      return socket.emit("call:decline", { targetId: from.id, reason: "busy" });
+    }
+    console.log(`📞 Incoming call from ${from.name}`);
+    incomingCallData = { from, offer };
+    incomingCallFrom.textContent = from.name;
+    incomingCallAvatar.innerHTML = renderAvatar(from);
+    incomingCallModal.style.display = "flex";
+  });
   socket.on("call:answer_received", async ({ answer }) => {
     if (
       !peerConnections[callPartnerId] ||
@@ -936,6 +947,31 @@ function setupSocketListeners() {
   });
 
   // Group Call Listeners
+  socket.on("group-call:incoming", ({ group, caller, callType }) => {
+    // Find the group name from the user's list of groups
+    const localGroup = myGroups.find((g) => g._id === group.id);
+    const groupName = localGroup ? localGroup.name : "a group";
+
+    if (
+      isCallActive ||
+      incomingCallData ||
+      privateRequestModal.style.display === "flex"
+    )
+      return; // User is busy
+
+    incomingCallData = { group, caller, callType }; // Store incoming call data
+    document.getElementById(
+      "incomingGroupCallFrom"
+    ).textContent = `${caller.name}`;
+    document.getElementById(
+      "incomingGroupCallStatus"
+    ).textContent = `started a call in ${groupName}`;
+    const avatarContainer = document.getElementById("incomingGroupCallAvatar");
+    avatarContainer.innerHTML = renderAvatar(caller);
+
+    document.getElementById("incomingGroupCallModal").style.display = "flex";
+  });
+
   socket.on("group-call:all-participants", (participants) => {
     console.log("Existing participants:", participants);
     participants.forEach((participant) => {
@@ -1023,6 +1059,18 @@ function setupSocketListeners() {
     showAlert("Transfer Declined", message, "info");
     cleanUpFileTransfer(byUser.id);
     fileTransferProgressModal.style.display = "none";
+  });
+  // FIX: Add the missing listener for when a file transfer request is accepted
+  socket.on("file:request_accepted", async ({ byUser }) => {
+    if (
+      currentFileTransfer &&
+      currentFileTransfer.status === "pending" &&
+      currentFileTransfer.targetId === byUser.id
+    ) {
+      console.log(`✅ ${byUser.name} accepted the file transfer.`);
+      // The sender (initiator) now creates the P2P connection
+      await createP2PFileConnection(byUser.id, true);
+    }
   });
   socket.on("file:signal", async ({ senderId, signal }) => {
     const pc = fileTransferConnections[senderId];
@@ -1892,16 +1940,28 @@ async function createPeerConnection(partnerSocketId, isInitiator) {
   }
 }
 
-async function startMediaCall(constraints) {
+async function startMediaCall(constraints, isJoining = false) {
   if (isCallActive) return;
 
   currentCallType = currentRoom.type;
+
   if (currentCallType === "private") {
     const partnerInfo = connectedRooms[currentRoom.id]?.withUser;
     if (!partnerInfo) return displayError("Could not find a user to call.");
     callPartnerId = partnerInfo.id;
-  } else if (currentCallType !== "group") {
-    return;
+  } else if (currentCallType === "group") {
+    // If we are NOT joining, it means we are the one starting the call.
+    if (!isJoining) {
+      const groupId = currentRoom.id.split("-")[1];
+      // Emit the event to the server to notify other members.
+      socket.emit("group-call:start", {
+        groupId,
+        callType: constraints.video ? "video" : "audio",
+      });
+      showGameOverlayMessage(`📞 Starting group call...`, 5000, "system");
+    }
+  } else {
+    return; // Not a callable room type
   }
 
   isCallActive = true;
@@ -1918,10 +1978,9 @@ async function startMediaCall(constraints) {
         "system"
       );
       createPeerConnection(callPartnerId, true);
-    } else {
-      // Group Call
+    } else if (currentCallType === "group") {
+      // Everyone (initiator and joiners) must join the socket.io call room
       socket.emit("group-call:join", { roomId: currentRoom.id });
-      showGameOverlayMessage(`📞 Starting group call...`, 5000, "system");
     }
   } catch (err) {
     console.error("Error starting call:", err);
@@ -1985,12 +2044,40 @@ function endCall(notifyPeer = true) {
 
 // --- CALL EVENT LISTENERS ---
 startAudioCallBtn.addEventListener("click", () =>
-  startMediaCall({ audio: true, video: false })
+  startMediaCall({ audio: true, video: false }, false)
 );
 startVideoCallBtn.addEventListener("click", () =>
-  startMediaCall({ audio: true, video: true })
+  startMediaCall({ audio: true, video: true }, false)
 );
 endCallBtn.addEventListener("click", () => endCall(true));
+
+// FIX: Add event listeners for the incoming group call modal buttons
+document.getElementById("dismissGroupCallBtn").addEventListener("click", () => {
+  document.getElementById("incomingGroupCallModal").style.display = "none";
+  incomingCallData = null;
+});
+
+document
+  .getElementById("joinGroupCallBtn")
+  .addEventListener("click", async () => {
+    if (!incomingCallData) return;
+    const { group, callType } = incomingCallData;
+    const groupId = group.id;
+    document.getElementById("incomingGroupCallModal").style.display = "none";
+
+    const localGroup = myGroups.find((g) => g._id === groupId);
+    if (localGroup && currentRoom.id !== `group-${groupId}`) {
+      switchRoom(`group-${groupId}`, `👥 ${localGroup.name}`, "group");
+    }
+
+    // Use a short timeout to ensure the room switch is processed before starting media
+    setTimeout(() => {
+      // We are JOINING, not initiating, so we pass 'true'
+      startMediaCall({ audio: true, video: callType === "video" }, true);
+    }, 100);
+
+    incomingCallData = null;
+  });
 
 acceptCallBtn.addEventListener("click", async () => {
   if (!incomingCallData) return;
@@ -2190,39 +2277,65 @@ cancelFileTransferBtn.addEventListener("click", () => {
 });
 
 function setupSenderDataChannel(channel, targetId) {
-  channel.onopen = () => {
-    const { file } = currentFileTransfer;
-    updateFileProgressUI("sending", file);
+  const { file } = currentFileTransfer;
+  updateFileProgressUI("sending", file);
 
-    let offset = 0;
-    const reader = new FileReader();
+  const highWaterMark = 1024 * 1024; // Buffer up to 1MB
+  let offset = 0;
+  const reader = new FileReader();
 
-    reader.onload = (e) => {
-      if (!currentFileTransfer) return; // Transfer was cancelled
+  const readSlice = (o) => {
+    // Safety check to ensure the reader isn't busy
+    if (reader.readyState === 1) return;
+    const slice = file.slice(o, o + FILE_CHUNK_SIZE);
+    reader.readAsArrayBuffer(slice);
+  };
+
+  reader.onload = (e) => {
+    // FIX: Check if channel is still open before sending
+    if (!currentFileTransfer || channel.readyState !== "open") return;
+
+    try {
       channel.send(e.target.result);
       offset += e.target.result.byteLength;
+
       fileProgressBar.style.width = `${(offset / file.size) * 100}%`;
       fileProgressStatus.textContent = `Sent: ${(offset / 1024 / 1024).toFixed(
         2
       )} / ${(file.size / 1024 / 1024).toFixed(2)} MB`;
 
       if (offset < file.size) {
-        readSlice(offset);
+        // FIX: Don't call readSlice here directly. Let onbufferedamountlow handle it.
+        if (channel.bufferedAmount < highWaterMark) {
+          readSlice(offset);
+        }
       } else {
+        // Done sending
         channel.send(JSON.stringify({ done: true }));
+        updateFileProgressUI("complete", file);
         showAlert("Success", "File sent successfully!", "success");
-        setTimeout(() => {
-          cleanUpFileTransfer(targetId);
-          fileTransferProgressModal.style.display = "none";
-        }, 1500);
       }
-    };
+    } catch (error) {
+      console.error("File send error:", error);
+      showAlert(
+        "Transfer Failed",
+        "An error occurred while sending the file.",
+        "error"
+      );
+      cleanUpFileTransfer(targetId);
+      fileTransferProgressModal.style.display = "none";
+    }
+  };
 
-    const readSlice = (o) => {
-      const slice = file.slice(o, o + FILE_CHUNK_SIZE);
-      reader.readAsArrayBuffer(slice);
-    };
+  // This event is the key to preventing the race condition
+  channel.onbufferedamountlow = () => {
+    if (offset < file.size) {
+      readSlice(offset);
+    }
+  };
 
+  channel.onopen = () => {
+    // Send metadata and start the transfer
     channel.send(
       JSON.stringify({ name: file.name, size: file.size, type: file.type })
     );
@@ -2235,36 +2348,97 @@ function setupSenderDataChannel(channel, targetId) {
 }
 
 function setupReceiverDataChannel(channel, senderId) {
-  fileChunks[senderId] = [];
+  let fileWriter;
   let receivedSize = 0;
   let fileMeta;
+  let useFileSystemApi = "showSaveFilePicker" in window;
 
-  channel.onmessage = (event) => {
-    if (typeof event.data === "string") {
-      const data = JSON.parse(event.data);
-      if (data.done) {
-        const fileBlob = new Blob(fileChunks[senderId], {
-          type: fileMeta.type,
-        });
-        const url = URL.createObjectURL(fileBlob);
-        fileDownloadLinkContainer.innerHTML = `<a href="${url}" download="${fileMeta.name}">Download ${fileMeta.name}</a>`;
-        fileDownloadLinkContainer.style.display = "block";
-        fileProgressStatus.textContent = "Download ready!";
-        cancelFileTransferBtn.textContent = "Close";
-        delete fileChunks[senderId];
-        return;
+  // FIX: Always initialize the fileChunks array, just in case the user cancels the save dialog.
+  fileChunks[senderId] = [];
+
+  channel.onmessage = async (event) => {
+    try {
+      if (typeof event.data === "string") {
+        const data = JSON.parse(event.data);
+        if (data.done) {
+          // Transfer is complete
+          if (useFileSystemApi && fileWriter) {
+            await fileWriter.close();
+          } else if (fileChunks[senderId] && fileChunks[senderId].length > 0) {
+            // Create a downloadable link for the in-memory file
+            const fileBlob = new Blob(fileChunks[senderId], {
+              type: fileMeta.type,
+            });
+            const downloadUrl = URL.createObjectURL(fileBlob);
+            const downloadLink = document.createElement("a");
+            downloadLink.href = downloadUrl;
+            downloadLink.download = fileMeta.name;
+            downloadLink.textContent = `Download ${fileMeta.name}`;
+
+            fileDownloadLinkContainer.innerHTML = "";
+            fileDownloadLinkContainer.appendChild(downloadLink);
+          }
+          updateFileProgressUI("complete", fileMeta);
+          showAlert("Success", "File received successfully!", "success");
+          return;
+        } else {
+          // This is the initial metadata message
+          fileMeta = data;
+          receivedSize = 0;
+
+          if (useFileSystemApi) {
+            try {
+              const handle = await window.showSaveFilePicker({
+                suggestedName: fileMeta.name,
+              });
+              fileWriter = (await handle.createWritable()).getWriter();
+            } catch (err) {
+              // User cancelled the save dialog. We'll fall back to the in-memory method.
+              console.log(
+                "User cancelled save dialog. Falling back to in-memory transfer."
+              );
+              useFileSystemApi = false; // Disable API for the rest of this transfer
+            }
+          }
+        }
       } else {
-        fileMeta = data;
+        // This is a file chunk (ArrayBuffer)
+        receivedSize += event.data.byteLength;
+        if (useFileSystemApi && fileWriter) {
+          await fileWriter.write(event.data);
+        } else {
+          // Store the chunk in memory
+          fileChunks[senderId].push(event.data);
+        }
+
+        fileProgressBar.style.width = `${
+          (receivedSize / fileMeta.size) * 100
+        }%`;
+        fileProgressStatus.textContent = `Received: ${(
+          receivedSize /
+          1024 /
+          1024
+        ).toFixed(2)} / ${(fileMeta.size / 1024 / 1024).toFixed(2)} MB`;
       }
-    } else {
-      fileChunks[senderId].push(event.data);
-      receivedSize += event.data.byteLength;
-      fileProgressBar.style.width = `${(receivedSize / fileMeta.size) * 100}%`;
-      fileProgressStatus.textContent = `Received: ${(
-        receivedSize /
-        1024 /
-        1024
-      ).toFixed(2)} / ${(fileMeta.size / 1024 / 1024).toFixed(2)} MB`;
+    } catch (err) {
+      console.error("Error receiving file:", err);
+      showAlert(
+        "Transfer Failed",
+        err.message || "An error occurred while receiving the file.",
+        "error"
+      );
+      if (useFileSystemApi && fileWriter) await fileWriter.abort();
+      channel.close();
+    }
+  };
+
+  channel.onclose = () => {
+    if (useFileSystemApi && fileWriter && !fileWriter.closed) {
+      fileWriter.abort();
+    }
+    cleanUpFileTransfer(senderId);
+    if (fileTransferProgressModal.style.display === "flex") {
+      fileTransferProgressModal.style.display = "none";
     }
   };
 }
@@ -2282,9 +2456,18 @@ function updateFileProgressUI(status, file) {
   fileProgressInfo.textContent = `${fileName} (${fileSize})`;
   fileProgressBar.style.width = "0%";
   fileProgressStatus.textContent =
-    status === "requesting" ? "Waiting for response..." : "Initializing...";
-  fileDownloadLinkContainer.style.display = "none";
-  cancelFileTransferBtn.textContent = "Cancel";
+    status === "requesting"
+      ? "Waiting for response..."
+      : status === "complete"
+      ? "File saved successfully!"
+      : "Initializing...";
+  fileDownloadLinkContainer.style.display =
+    status === "complete" && !("showSaveFilePicker" in window)
+      ? "block"
+      : "none";
+
+  cancelFileTransferBtn.textContent =
+    status === "complete" ? "Close" : "Cancel";
 }
 
 function cleanUpFileTransfer(partnerId) {
@@ -2527,17 +2710,14 @@ saveAvatarChangeBtn.addEventListener("click", async () => {
 
   const token = localStorage.getItem("token");
   try {
-    const response = await fetch(
-      "https://backend-1-75se.onrender.com/update-profile",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ profilePicture: newProfilePictureDataUrl }),
-      }
-    );
+    const response = await fetch(backendUrl + "/update-profile", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ profilePicture: newProfilePictureDataUrl }),
+    });
 
     if (response.ok) {
       showAlert("Success", "Profile picture updated!", "success");
