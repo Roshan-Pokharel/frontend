@@ -330,15 +330,18 @@ registerForm.addEventListener("submit", async (e) => {
   const password = document.getElementById("registerPassword").value;
 
   try {
-    const response = await fetch("http://localhost:3000/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        username,
-        password,
-        profilePicture: newProfilePictureDataUrl,
-      }),
-    });
+    const response = await fetch(
+      "https://backend-1-75se.onrender.com/register",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username,
+          password,
+          profilePicture: newProfilePictureDataUrl,
+        }),
+      }
+    );
     const data = await response.json();
     if (response.ok) {
       showAlert(
@@ -369,7 +372,7 @@ loginForm.addEventListener("submit", async (e) => {
   const password = document.getElementById("loginPassword").value;
 
   try {
-    const response = await fetch("http://localhost:3000/login", {
+    const response = await fetch("https://backend-1-75se.onrender.com/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
@@ -421,7 +424,7 @@ function connectSocket(token) {
   if (socket && socket.active) {
     socket.disconnect();
   }
-  socket = io("http://localhost:3000", {
+  socket = io("https://backend-1-75se.onrender.com/", {
     auth: {
       token,
     },
@@ -2524,14 +2527,17 @@ saveAvatarChangeBtn.addEventListener("click", async () => {
 
   const token = localStorage.getItem("token");
   try {
-    const response = await fetch("http://localhost:3000/update-profile", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ profilePicture: newProfilePictureDataUrl }),
-    });
+    const response = await fetch(
+      "https://backend-1-75se.onrender.com/update-profile",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ profilePicture: newProfilePictureDataUrl }),
+      }
+    );
 
     if (response.ok) {
       showAlert("Success", "Profile picture updated!", "success");
